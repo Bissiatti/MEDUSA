@@ -38,7 +38,7 @@ repositories, no private files.
 | `S-Learner_RF` | Random forest on `[X, one-hot(T)]` | scikit-learn, CPU |
 | `T-Learner_RF` | One random forest per arm | Arms missing from training are reported as unsupported |
 | `HydraNet` | Shared representation + one outcome head per arm + propensity head | PyTorch |
-| `MEDUSA` | Shared outcome network over treatment **bit vectors** + propensity head (+ optional DR penalty) | PyTorch, see [MEDUSA.md](MEDUSA.md) |
+| `MEDUSA` | Shared outcome network over treatment **bit vectors** + propensity head | PyTorch, see [MEDUSA.md](MEDUSA.md) |
 
 ## Repository contents
 
@@ -46,7 +46,7 @@ repositories, no private files.
 |---|---|
 | `run_validation.py` | The validation runner: DGP, scenario builders, metrics, CLI. |
 | `models.py` | Estimator suite used by the runner (S/T-Learner, HydraNet, MEDUSA). |
-| `medusa.py` | Canonical standalone MEDUSA: architecture + full-featured estimator with doubly robust extensions. See [MEDUSA.md](MEDUSA.md). |
+| `medusa.py` | MEDUSA neural network architecture used by the estimator in `models.py`. See [MEDUSA.md](MEDUSA.md). |
 | `config.json` | Default simulation, DGP, and model hyperparameters. |
 | `requirements.txt` | Python dependencies. |
 
@@ -211,7 +211,5 @@ The runner handles scenario construction, evaluation, and reporting.
 Every run is fully seeded (`config.json` `seed`, per-model offsets) and
 saves its resolved configuration. Neural models run on GPU when available
 (`--device`); note that GPU results can differ slightly across hardware.
-The results generated for the accompanying study use the exact estimator
-configuration in `models.py`; `medusa.py` additionally exposes the doubly
-robust extensions (`gamma_dr`, Hajek-AIPW estimates) described in
-[MEDUSA.md](MEDUSA.md).
+The results generated for the accompanying study use the estimator
+configuration in `models.py` and the network architecture in `medusa.py`.

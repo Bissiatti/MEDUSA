@@ -1,165 +1,91 @@
-# MEDUSA — Multi-treatment deep structured representation for counterfactual estimation
+# MEDUSA
 
-MEDUSA is a deep multi-treatment causal model implemented in PyTorch. Given
-covariates `X`, a discrete treatment `T` with `K` arms, and a binary outcome
-`Y`, it learns the potential-outcome surface `mu_t(X) = P(Y(t) = 1 | X)` for
-**every** arm `t` — including arms never observed for similar units — by
-sharing one outcome network across all arms and regularizing it with a
-propensity head and a doubly robust moment penalty.
+MEDUSA is a PyTorch model for estimating binary potential outcomes across
+multiple treatment arms. It encodes covariates once, then shares one outcome
+network across all arms. A separate head predicts treatment propensities.
 
-Two files in this repository involve MEDUSA:
+## Files
 
-- **`medusa.py`** — the canonical, self-contained implementation: the
-  `MEDUSA` network, `MedusaConfig`, and the full-featured
-  `MedusaCausalModel` estimator (with the optional doubly robust moment
-  penalty and Hajek-AIPW population estimates). **Use this one** for your own
-  data.
-- **`models.py`** — the estimator suite used by `run_validation.py`. It
-  imports the `MEDUSA` architecture from `medusa.py` and keeps the exact
-  training objective configured for the validation study (the doubly robust
-  penalty disabled, matching `config.json`).
+- `medusa.py` defines the neural network architecture.
+- `models.py` defines `MedusaConfig` and `MedusaCausalModel`, including the
+  training objective and potential-outcome predictions.
+- `run_validation.py` reads the `medusa_*` settings from `config.json` and
+  builds the estimator used in the validation suite.
 
 ## Architecture
 
 ```text
-                X (p covariates)
-                 |
-            +----v-----+      +-----------+
-            | Encoder  +----->|  Decoder  |--> X_hat (auxiliary reconstruction)
-            |  p->64->32->d   +-----------+
-            +----+-----+
-                 | z (latent, dim d)
-       +---------+-------------------+
-       |                             |
-+------v-------+            +--------v---------+
-| Propensity   |            | Shared outcome   |
-| head         |            | net (per arm t)  |
-| d->64->K     |            | [z || bits(t)]   |
-+------+-------+            | ->128->64->1     |
-       |                    +--------+---------+
-       | logits g(X)                 | logits mu_t(X), t = 0..K-1
-       v                             v
-  P(T=t|X)                    P(Y(t)=1|X)  (after sigmoid)
+                   +----------------------+
+                   |                      v
+X (p features) -> Encoder -> z -> Propensity head -> treatment logits
+                              |
+                              +-> Shared outcome network [z || bits(t)]
+                                      |                 |
+                                      v                 v
+                               factual logit      all-arm logits
 ```
 
-Components:
+The encoder is an MLP with widths `p -> 64 -> 32 -> latent_dim`, using layer
+normalization and dropout. The propensity head maps the latent representation
+to one logit per treatment. The shared outcome network takes the latent
+representation concatenated with the treatment's raw binary code and returns
+an outcome logit. Applying a sigmoid gives `P(Y(t) = 1 | X)`.
 
-- **Encoder** `phi(X)`: MLP `p -> 64 (LayerNorm, ReLU, Dropout 0.1) -> 32
-  (ReLU, Dropout 0.1) -> d (ReLU)` producing the latent representation `z`.
-- **Decoder**: `d -> 32 -> p`, auxiliary reconstruction head (no loss term in
-  the current version; kept for architectural compatibility).
-- **Propensity head** (DragonNet core): `d -> 64 -> K` logits for
-  `P(T = t | X)`.
-- **Shared outcome network**: a single `d + b -> 128 -> 64 -> 1` MLP evaluated
-  at every treatment arm. Arms are encoded as **raw binary bit vectors**
-  `bits(t)` with `b = ceil(log2 K)` bits, concatenated to `z` — no learned
-  embedding — so the Hamming geometry between arms is preserved in the input
-  space. The baseline arm `0` is the all-zero vector.
-- **Classifier** (factual refinement head): `[x || z || bits(t) || mu_t] ->
-  64 -> 32 -> 1`. Disabled in the current loss (`delta_class = 0`).
+For `K` treatment arms, each arm is encoded with `ceil(log2(K))` bits. Arm zero
+uses the all-zero code. The network forward pass returns three tensors:
 
-All linear layers use Xavier-uniform initialization.
+1. The factual outcome logit, with shape `(batch_size, 1)`.
+2. Outcome logits for all arms, with shape `(batch_size, K)`.
+3. Treatment propensity logits, with shape `(batch_size, K)`.
 
 ## Training objective
 
-For binary `Y in {0, 1}`, the per-batch loss in `medusa.py` is:
+For binary outcomes, `MedusaCausalModel.fit` minimizes:
 
 ```text
-L = L_factual + alpha * L_propensity + gamma * L_DR + beta * L_anchor
+L = L_factual + alpha_propensity * L_propensity + beta_anchor * L_anchor
 ```
 
-- **`L_factual`** — binary cross-entropy of the factual logit, averaged
-  **within** each treatment arm present in the batch and then **across** arms
-  (balanced factual loss; arms contribute equally regardless of frequency).
-- **`L_propensity`** — cross-entropy of the propensity logits against the
-  observed arm, divided by `log(K)` so a uniform propensity scores ~1.
-  Weighted by `alpha_propensity`.
-- **`L_DR`** — squared **normalized AIPW moment** per arm: for each arm `t`,
-  the Hajek-normalized inverse-propensity-weighted mean residual
-  `sum_i I(T_i=t)/g_t(X_i) * (Y_i - mu_t(X_i)) / sum_i I(T_i=t)/g_t(X_i)`
-  (in `[-1, 1]` for binary `Y`), squared and averaged over present arms. The
-  propensity is **detached** so the outcome loss cannot reshape `g` just to
-  shrink the weights. Weighted by `gamma_dr`; set `gamma_dr = 0` to disable.
-- **`L_anchor`** — BCE of the counterfactual head output for the baseline
-  arm `t = 0` on units actually observed under `t = 0`. Weighted by
-  `beta_anchor`.
+- `L_factual` is binary cross-entropy for the observed treatment. It averages
+  the loss within each treatment arm present in the batch, then across arms.
+- `L_propensity` is cross-entropy for the observed treatment, divided by
+  `log(K)` to keep its scale comparable across treatment counts.
+- `L_anchor` is binary cross-entropy for the predicted outcome under arm zero,
+  evaluated on observations assigned to arm zero. It is zero for a batch with
+  no arm-zero observations.
 
-Optimization: AdamW with gradient-norm clipping (`gradient_clip`); NaN/Inf
-losses raise immediately. The variant in `models.py` used by the validation
-suite corresponds to `gamma_dr = 0`.
+The estimator uses AdamW, clips the gradient norm, and raises an error if the
+training loss becomes non-finite. `predict_potential_outcomes(X)` returns the
+sigmoid-transformed all-arm logits as an `(n_samples, K)` array.
 
-## Doubly robust population estimates
+## Configuration
 
-`MedusaCausalModel.estimate_population_potential_outcomes(X, T, Y)` estimates
-`E[Y(t)]` with **Hajek-AIPW** (normalized augmented inverse propensity
-weighting): the plugin mean of `mu_t(X)` plus an IPW correction of the
-residuals. The estimator is doubly robust — consistent if either the outcome
-model or the propensity model is correct — under positivity and
-out-of-sample or cross-fitted evaluation.
-`estimate_ate(X, T, Y, reference=0)` returns `E[Y(t)] - E[Y(reference)]` for
-all arms.
+`MedusaConfig` is defined in `models.py`. The runner maps these `config.json`
+keys to it:
 
-## Quick start
+| `config.json` key | Purpose |
+|---|---|
+| `medusa_latent_dim` | Dimension of the learned representation. |
+| `medusa_epochs` | Number of training epochs. |
+| `medusa_batch_size` | Number of observations per training batch. |
+| `medusa_lr` | AdamW learning rate. |
+| `medusa_weight_decay` | AdamW weight decay. |
+| `medusa_alpha_propensity` | Weight of the propensity loss. |
+| `medusa_beta_anchor` | Weight of the arm-zero anchor loss. |
+| `medusa_gradient_clip` | Maximum gradient norm. |
+| `verbose_medusa` | Enables periodic epoch and loss messages. |
 
-```python
-import numpy as np
-from medusa import MedusaCausalModel, MedusaConfig
+The runner also sets the treatment-bit count, device, and random seed from the
+scenario and command-line settings.
 
-config = MedusaConfig(
-    latent_dim=12,
-    epochs=100,
-    batch_size=256,
-    lr=8e-4,
-    weight_decay=2e-4,
-    alpha_propensity=0.3,
-    gamma_dr=0.1,
-    beta_anchor=0.05,
-    device=None,          # "cuda", "cpu", or None for auto
-    random_state=42,
-)
-
-model = MedusaCausalModel(K=4, config=config)
-model.fit(X, T, Y)                     # X: (n, p), T: (n,) in 0..K-1, Y: (n,) in {0,1}
-
-mu  = model.predict_potential_outcomes(X_new)   # (n, K) probabilities P(Y(t)=1|X)
-g   = model.predict_propensity(X_new)           # (n, K) propensities P(T=t|X)
-pop = model.estimate_population_potential_outcomes(X_val, T_val, Y_val)  # E[Y(t)]
-ate = model.estimate_ate(X_val, T_val, Y_val)   # E[Y(t)] - E[Y(0)]
-```
-
-`T` may also be passed directly as bit vectors of shape
-`(n, ceil(log2 K))`. `Y` must be binary (`0`/`1`); covariates are
-standardized internally.
-
-### Using the raw network
+## Raw network example
 
 ```python
 import torch
 from medusa import MEDUSA
 
-net = MEDUSA(input_size=10, latent_dim=12, num_treatments=4, treatment_bits=2)
+net = MEDUSA(input_size=10, latent_dim=8, num_treatments=4, treatment_bits=2)
 x = torch.randn(32, 10)
-t_bits = torch.randint(0, 2, (32, 2)).float()
-factual_logit, all_logits, y_logit, x_recon, z, propensity_logits = net(x, t_bits)
+treatment_bits = torch.randint(0, 2, (32, 2)).float()
+factual_logits, all_arm_logits, propensity_logits = net(x, treatment_bits)
 ```
-
-## Configuration reference (`MedusaConfig`)
-
-| Field | Default | Meaning |
-|---|---|---|
-| `latent_dim` | 12 | Dimension `d` of the representation `z`. |
-| `treatment_bits` | `None` | Bits per arm code; defaults to `ceil(log2 K)`. |
-| `epochs` | 100 | Training epochs. |
-| `batch_size` | 256 | Minibatch size. |
-| `lr` | 8e-4 | AdamW learning rate. |
-| `weight_decay` | 2e-4 | AdamW weight decay. |
-| `alpha_propensity` | 0.3 | Weight of the propensity cross-entropy. |
-| `gamma_dr` | 0.1 | Weight of the normalized DR moment penalty (`0` disables it). |
-| `beta_anchor` | 0.05 | Weight of the baseline-arm anchor BCE. |
-| `propensity_eps` | 1e-6 | Lower clamp for propensities in IPW terms. |
-| `gradient_clip` | 5.0 | Max gradient norm. |
-| `device` | `None` | `"cuda"`, `"cpu"`, or `None` (auto-detect). |
-| `random_state` | 42 | Seed for NumPy and PyTorch. |
-
-`treatment_embed_dim` and `delta_class` are retained only for backward
-compatibility with older configs and have no effect.

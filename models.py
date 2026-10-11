@@ -8,11 +8,9 @@ The controlled validation runner imports these estimators from this sibling
 module. Random-forest estimators require NumPy, scikit-learn, and joblib;
 HydraNet and MEDUSA also require PyTorch.
 
-The MEDUSA network architecture itself is defined once in ``medusa.py`` and
-imported here; this module keeps the exact MEDUSA training configuration used
-by the validation suite. ``medusa.py`` additionally ships a full-featured
-estimator with an optional doubly robust moment penalty and Hajek-AIPW
-population estimates.
+The MEDUSA network architecture is defined in ``medusa.py`` and imported
+here. This module contains the estimator and training configuration used by
+the validation suite.
 """
 
 from __future__ import annotations
@@ -414,8 +412,8 @@ def make_random_forest(
     )
 
 # The MEDUSA network architecture is imported from medusa.py (see the top of
-# this module). MedusaConfig and MedusaCausalModel below keep the exact
-# training objective used by the validation suite.
+# this module). The estimator below implements the training objective used by
+# the validation suite.
 
 @dataclass
 class MedusaConfig:
@@ -583,14 +581,9 @@ class MedusaCausalModel(BaseCausalModel):
                 tb = self._bits_to_indices_torch(tb_bits)
                 y_target = yb.to(device).view(-1)
 
-                (
-                    factual_out,
-                    outputs_all,
-                    _,  # The auxiliary classifier output is not in this loss.
-                    _,  # The reconstruction output is not in this loss.
-                    _,
-                    propensity_logits,
-                ) = self.model(xb, tb_bits)
+                factual_out, outputs_all, propensity_logits = self.model(
+                    xb, tb_bits
+                )
 
                 factual_logit = factual_out.view(-1)
                 loss_factual = self._balanced_factual_loss(
