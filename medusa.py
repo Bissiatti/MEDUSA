@@ -1,7 +1,8 @@
 """MEDUSA: multi-treatment causal inference with deep structured representations.
 
-Standalone PyTorch export of the MEDUSA architecture used by the drought
-insurance counterfactual pipeline (see ``models.py`` at the repository root).
+Standalone PyTorch implementation of the MEDUSA architecture for estimating
+potential outcomes under multiple discrete treatments. See MEDUSA.md for the
+full model documentation.
 
 Contents
 --------
